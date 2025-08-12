@@ -76,9 +76,15 @@ def obtener_rutas():
         }
         
         for nombre, ruta in rutas.items():
-            if nombre != 'cups':
+            if nombre not in ['cups', 'HOSVITAL']:  # No crear HOSVITAL automáticamente
                 ruta.mkdir(parents=True, exist_ok=True)
                 print(f"Carpeta {nombre} verificada/creada: {ruta}")
+        
+        # Verificar si existe HOSVITAL pero no crearla
+        if rutas['HOSVITAL'].exists():
+            print(f"Carpeta HOSVITAL encontrada: {rutas['HOSVITAL']}")
+        else:
+            print(f"Advertencia: Carpeta HOSVITAL no encontrada en {rutas['HOSVITAL']}")
         
         return rutas
     except Exception as e:
@@ -91,6 +97,9 @@ def cargar_cups():
         ruta_script = Path(__file__).resolve().parent
         ruta_cups = ruta_script / 'Resolucion CUPS.xlsx'
         print("\nCargando archivo CUPS...")
+        if not ruta_cups.exists():
+            print("Advertencia: Archivo CUPS no encontrado. Se continuará sin mapeo de códigos.")
+            return {}
         cups_df = pd.read_excel(ruta_cups, usecols=['CUPS', 'DESCRIPCION CUPS'])
         return dict(zip(cups_df['CUPS'], cups_df['DESCRIPCION CUPS']))
     except Exception as e:
@@ -405,66 +414,142 @@ def calcular_dias_internacion(df_ah, df_ac_ap):
     
     return df_ac_ap_procesado
 
+def procesar_hosvital(rutas):
+    """Procesa archivos HOSVITAL o devuelve DataFrame vacío si no existe la carpeta"""
+    try:
+        if not rutas['HOSVITAL'].exists():
+            print("\nAdvertencia: No se encontró la carpeta HOSVITAL. Se usará 'NO HAY POBLACION IDENTIFICADA'")
+            return pd.DataFrame(columns=['Key-Ips', 'Municipio', 'Departamento', 'Periodo'])
+        
+        print("\nCargando archivos Hosvital...")
+        hosvital_files = list(rutas['HOSVITAL'].glob('*.xlsx'))
+        
+        if not hosvital_files:
+            print("Advertencia: No se encontraron archivos .xlsx en HOSVITAL")
+            return pd.DataFrame(columns=['Key-Ips', 'Municipio', 'Departamento', 'Periodo'])
+        
+        hosvital_dfs = []
+        
+        for archivo in hosvital_files:
+            try:
+                df_hosvital = pd.read_excel(archivo)
+                
+                # Buscar columnas relevantes con manejo de errores
+                col_identificacion = next(
+                    (col for col in df_hosvital.columns 
+                     if any(x in col.lower() for x in ['número de documento', 'numero de documento', 'identificación'])),
+                    None
+                )
+                
+                if col_identificacion is None:
+                    print(f"Advertencia: No se encontró columna de identificación en {archivo.name}")
+                    continue
+                
+                col_municipio = next(
+                    (col for col in df_hosvital.columns if 'municipio' in col.lower() and 'afili' in col.lower()),
+                    None
+                )
+                
+                col_departamento = next(
+                    (col for col in df_hosvital.columns if 'departamento' in col.lower()),
+                    None
+                )
+                
+                df_hosvital['Key-Ips'] = archivo.stem[:7] + '-' + df_hosvital[col_identificacion].astype(str)
+                
+                # Seleccionar columnas basado en lo que existe
+                columns_to_select = ['Key-Ips']
+                if col_municipio:
+                    columns_to_select.append(col_municipio)
+                if col_departamento:
+                    columns_to_select.append(col_departamento)
+                
+                hosvital_dfs.append(df_hosvital[columns_to_select])
+                
+            except Exception as e:
+                print(f"Error procesando archivo {archivo.name}: {str(e)}")
+                continue
+        
+        if not hosvital_dfs:
+            print("Advertencia: No se pudo procesar ningún archivo HOSVITAL")
+            return pd.DataFrame(columns=['Key-Ips', 'Municipio', 'Departamento', 'Periodo'])
+        
+        hosvital_consolidado = pd.concat(hosvital_dfs, ignore_index=True)
+        hosvital_consolidado['Periodo'] = hosvital_consolidado['Key-Ips'].str.split('-').str[0]
+        
+        # Renombrar columnas para consistencia
+        if col_municipio:
+            hosvital_consolidado = hosvital_consolidado.rename(columns={col_municipio: 'Municipio'})
+        else:
+            hosvital_consolidado['Municipio'] = 'NO HAY POBLACION IDENTIFICADA'
+        
+        if col_departamento:
+            hosvital_consolidado = hosvital_consolidado.rename(columns={col_departamento: 'Departamento'})
+        else:
+            hosvital_consolidado['Departamento'] = 'NO HAY POBLACION IDENTIFICADA'
+        
+        # Agrupar por las columnas disponibles
+        group_cols = ['Periodo', 'Municipio']
+        if 'Departamento' in hosvital_consolidado.columns:
+            group_cols.insert(1, 'Departamento')
+        
+        hosvital_consolidado_final = hosvital_consolidado.groupby(group_cols).size().reset_index(name='Cantidad')
+        
+        return hosvital_consolidado_final
+    
+    except Exception as e:
+        print(f"Error inesperado al procesar HOSVITAL: {str(e)}")
+        return pd.DataFrame(columns=['Key-Ips', 'Municipio', 'Departamento', 'Periodo'])
+
 def procesar_rips():
     """Proceso principal modificado para generar XLSX con formato adecuado"""
     try:
         rutas = obtener_rutas()
         cups_dict = cargar_cups()
 
-        print("\nCargando archivos Hosvital...")
-        hosvital_files = list(rutas['HOSVITAL'].glob('*.xlsx'))
-        hosvital_dfs = []
+        # Procesar HOSVITAL con manejo de errores
+        hosvital_consolidado_final = procesar_hosvital(rutas)
         
-        for archivo in hosvital_files:
-            df_hosvital = pd.read_excel(archivo)
-            col_identificacion = [col for col in df_hosvital.columns if any(x in col.lower() for x in ['número de documento', 'numero de documento', 'identificación'])][0]
-            col_municipio = [col for col in df_hosvital.columns if 'municipio afili' in col.lower()][0]
-            
-            try:
-                col_departamento = [col for col in df_hosvital.columns if 'departamento' in col.lower()][0]
-            except IndexError:
-                col_departamento = None
-        
-            df_hosvital['Key-Ips'] = archivo.stem[:7] + '-' + df_hosvital[col_identificacion].astype(str)
-        
-            if col_departamento:
-                hosvital_dfs.append(df_hosvital[['Key-Ips', col_municipio, col_departamento]])
-            else:
-                hosvital_dfs.append(df_hosvital[['Key-Ips', col_municipio]])
-        
-        hosvital_consolidado = pd.concat(hosvital_dfs, ignore_index=True)
-        hosvital_consolidado['Periodo'] = hosvital_consolidado['Key-Ips'].str.split('-').str[0]
-    
-        if col_departamento:
-            hosvital_consolidado_final = hosvital_consolidado.groupby(['Periodo', col_departamento, col_municipio]).size().reset_index(name='Cantidad')
+        # Crear DataFrame vacío para el merge si no hay datos HOSVITAL
+        if hosvital_consolidado_final.empty:
+            hosvital_for_merge = pd.DataFrame(columns=['Key-Ips', 'Municipio', 'Departamento'])
         else:
-            hosvital_consolidado_final = hosvital_consolidado.groupby(['Periodo', col_municipio]).size().reset_index(name='Cantidad')
-        
+            hosvital_for_merge = hosvital_consolidado_final[['Key-Ips', 'Municipio', 'Departamento']].drop_duplicates('Key-Ips')
+
         # Procesar archivos RIPS
         tipos_procesar = ['AC', 'AP', 'AM', 'AT', 'AH', 'AN']
         dfs = {}
         
         print("\nProcesando archivos RIPS...")
         for tipo in tipos_procesar:
-            archivos = list(rutas[tipo].glob('*.txt'))
-            if archivos:
+            try:
+                archivos = list(rutas[tipo].glob('*.txt'))
+                if not archivos:
+                    print(f"Advertencia: No se encontraron archivos {tipo}")
+                    continue
+                
                 print(f"\nProcesando {len(archivos)} archivos {tipo}...")
                 total_registros = 0
                 
                 for archivo in archivos:
-                    df_temp = procesar_archivo(archivo, cups_dict, tipo)
-                    registros = len(df_temp)
-                    total_registros += registros
-                    print(f"✓ {archivo.name} - {registros:,} registros")
-                    
-                    if tipo in dfs:
-                        dfs[tipo] = pd.concat([dfs[tipo], df_temp])
-                    else:
-                        dfs[tipo] = df_temp
+                    try:
+                        df_temp = procesar_archivo(archivo, cups_dict, tipo)
+                        registros = len(df_temp)
+                        total_registros += registros
+                        print(f"✓ {archivo.name} - {registros:,} registros")
+                        
+                        if tipo in dfs:
+                            dfs[tipo] = pd.concat([dfs[tipo], df_temp])
+                        else:
+                            dfs[tipo] = df_temp
+                    except Exception as e:
+                        print(f"Error procesando archivo {archivo.name}: {str(e)}")
+                        continue
                 
                 print(f"Total {tipo}: {total_registros:,} registros")
-            else:
-                print(f"No se encontraron archivos {tipo}")
+            except Exception as e:
+                print(f"Error procesando tipo {tipo}: {str(e)}")
+                continue
 
         # Aplicar cálculo de días de internación si hay datos de AH y AC/AP
         if 'AH' in dfs and ('AC' in dfs or 'AP' in dfs):
@@ -501,6 +586,10 @@ def procesar_rips():
                     if col not in df.columns:
                         df[col] = np.nan
                 dfs_para_consolidado.append(df[columnas_requeridas])
+        
+        if not dfs_para_consolidado:
+            print("Advertencia: No hay datos para consolidar. Verifique que existan archivos RIPS.")
+            return
         
         consolidado = pd.concat(dfs_para_consolidado, ignore_index=True)
         
@@ -562,17 +651,17 @@ def procesar_rips():
             consolidado_final['Periodo'].str[:7] + '-' + consolidado_final['Identificacion'].astype(str),
             consolidado_final['Fecha'].apply(formatear_fecha) + '-' + consolidado_final['Identificacion'].astype(str))
         
-        consolidado_final = consolidado_final.merge(
-            hosvital_consolidado.drop_duplicates('Key-Ips'), 
-            left_on='Key-Ips', 
-            right_on='Key-Ips', 
-            how='left'
-        )
-
-        consolidado_final = consolidado_final.rename(columns={col_municipio: 'Municipio'})
-        consolidado_final['Municipio'] = consolidado_final['Municipio'].fillna('No Afiliado')
-        if col_departamento:
-            consolidado_final['Departamento'] = consolidado_final['Departamento'].fillna('No Afiliado')
+        # Hacer merge solo si hay datos HOSVITAL
+        if not hosvital_for_merge.empty:
+            consolidado_final = consolidado_final.merge(
+                hosvital_for_merge, 
+                left_on='Key-Ips', 
+                right_on='Key-Ips', 
+                how='left'
+            )
+        else:
+            consolidado_final['Municipio'] = 'NO HAY POBLACION IDENTIFICADA'
+            consolidado_final['Departamento'] = 'NO HAY POBLACION IDENTIFICADA'
         
         # Guardar archivos en formato XLSX con formato usando safe_save_excel
         print("\nGuardando archivos consolidados...")
@@ -605,4 +694,4 @@ def procesar_rips():
         raise
 
 if __name__ == "__main__":
-    procesar_rips()
+    procesar_rips() 
